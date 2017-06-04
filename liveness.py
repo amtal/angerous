@@ -1,5 +1,6 @@
 import binaryninja
 from binaryninja.log import log_info
+from binaryninja.enums import MediumLevelILOperation as MLOp
 
 def liveness(bv, fun):
     """Register/stackvar liveness.
@@ -7,11 +8,9 @@ def liveness(bv, fun):
     Iterates over MLIL in SSA form.
 
     - pro: stack/register usage abstracted into 'variables'
-    - pro: dependency tracking is already done via SSA
-    - PRO: architecture-agnostic as all hell
-    - con: some intermediate register uses elided as nops
-    - con: address spaces across all ILs differ slightly, per-instruction
-           markup won't map 1:1
+    - pro: dependency tracking for worklist alg. is already done via SSA
+    - con: some instructions get elided as nops for some reason?
+    - con: address spaces across all ILs differ slightly
     """
     ssa = fun.medium_level_il.ssa_form
     # Forward branches aren't available on instruction objects, only the block
@@ -21,10 +20,17 @@ def liveness(bv, fun):
                                         in bb.outgoing_edges] 
                          for bb in ssa.basic_blocks}
 
+    # Powerset lattice constructed from the set of live variables, top =
+    # everything is live, bottom = nothing is.
     bottom, top = set(), set(fun.vars)
+    # This lattice will be mapped over the set of nodes in an MLIL control flow
+    # graph. 
+    # The result (a "map lattice") is passed through the function "F", which
+    # adds information about register reads/writes. A fixpoint is reached once
+    # "F" can't add any more information to the lattice. The work list
+    # algorithm is used to find the fixpoint efficiently.
 
     def f(ea, cfg_to_vars):
-        """Abstract MLIL semantics on function CFG -> set of live variables."""
         # join live variables in dataflow ahead in CFG
         var = set().union(*[cfg_to_vars[next_ea] for next_ea 
                             in outgoing_branches.get(ea, [ea+1])])
@@ -32,8 +38,15 @@ def liveness(bv, fun):
         var -= set(ssa[ea].non_ssa_form.vars_written)
         # re-add anything read at current CFG node
         var |= set(ssa[ea].non_ssa_form.vars_read)
-        # TODO handle call by... checking calling convention?
-        # TODO handle unimplemented by worst-case assumption
+
+        if ssa[ea].operation in [
+                MLOp.MLIL_UNDEF, MLOp.MLIL_UNIMPL, MLOp.MLIL_UNIMPL_MEM,
+                ## In some cases, calls are covered by vars_Written/vars_read
+                ## I *think* that's for supported calling conventions?
+                ## anyway, not going to approximate calls
+                #MLOp.MLIL_CALL_SSA, MLOp.MLIL_CALL_SSA_UNTYPED, 
+            ]:
+            var |= top  # do a safe approximation
 
         # dependencies for current CFG node, in previous dataflow
         deps = [ssa.get_ssa_var_definition(r_v) for r_v in ssa[ea].vars_read]
@@ -73,11 +86,10 @@ def find_fixpoint(f, n, bottom):
     but maybe not) representing some interesting abstract domain.
 
     Since this is written in Python, you'll have to use your imagination for
-    all the type signatures.
+    all the type signatures. Implementation details:
 
-    Implementation details:
-
-    - X is represented as an indexed list
+    - X is represented as an indexed list (could be a dict instead, if
+      addressing was non-sequential)
     - F(X)->X is implemented as a function f that takes said list as arguments
       and returns a tuple of (value_at_xi, indexes_of_dependencies_in_X)
     - f is F(X) = [f(X) for i in range(|X|)], n is |X|, bottom is set() if it's
